@@ -9,12 +9,16 @@ ARCH=${1:-$( (offload-arch 2>/dev/null || rocminfo 2>/dev/null | grep -oE 'gfx[0
 NS=${2:-1 2 3 4 5}; ROUNDS=${3:-5}
 LOG=dotonly_sweep_${ARCH}.log
 ./extract_kernels.sh ${VLLM_SRC:-} | tee $LOG
-for N in $NS; do SKIP_EXTRACT=1 ./build_sweep.sh $N $ARCH >> $LOG 2>&1 & done; wait
+echo "building N=$NS in parallel (reduced dot-only build; GPU stays idle meanwhile)..." | tee -a $LOG
+for N in $NS; do
+  ( t0=$SECONDS; SKIP_EXTRACT=1 SWEEP_FLAGS=-DDOT_ONLY_BUILD ./build_sweep.sh $N $ARCH >> $LOG 2>&1 \
+      && echo "  built N=$N in $((SECONDS - t0)) s" || echo "  build N=$N FAILED, see isa_sweep_n$N/build.log" ) | tee -a $LOG &
+done; wait
 for N in $NS; do
   [[ -x wvsplitk_sweep_n$N ]] || { echo "build for N=$N failed, see isa_sweep_n$N/build.log"; exit 1; }
   (amd-smi metric -u 2>/dev/null | grep -m1 GFX_ACTIVITY || true) | tee -a $LOG
   ./wvsplitk_sweep_n$N --dot-only --shapes "$(cat general_shapes.txt)" --rounds $ROUNDS \
-      --csv sweep_${ARCH}_dotonly_n$N.csv >> $LOG 2>&1
+      --csv sweep_${ARCH}_dotonly_n$N.csv 2>&1 | tee -a $LOG
 done
 grep -c "WRONG RESULT" $LOG && echo "!! wrong results, see $LOG" || true
 python3 dot_compare.py $(for N in $NS; do echo sweep_${ARCH}_dotonly_n$N.csv; done)

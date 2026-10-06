@@ -12,12 +12,16 @@ LOG=general_sweep_${ARCH}.log
 SHAPES=$(cat general_shapes.txt)
 echo "arch=$ARCH Ns=$NS rounds=$ROUNDS target_ms=$TMS shapes=$(echo $SHAPES | tr , '\n' | wc -l) $(date)" | tee $LOG
 ./extract_kernels.sh ${VLLM_SRC:-} | tee -a $LOG   # once; parallel builds below skip it
-for N in $NS; do SKIP_EXTRACT=1 ./build_sweep.sh $N $ARCH >> $LOG 2>&1 & done; wait
+echo "building N=$NS in parallel (GPU stays idle; N=4/5 can take 10-15 min to link)..." | tee -a $LOG
+for N in $NS; do
+  ( t0=$SECONDS; SKIP_EXTRACT=1 ./build_sweep.sh $N $ARCH >> $LOG 2>&1 \
+      && echo "  built N=$N in $((SECONDS - t0)) s" || echo "  build N=$N FAILED, see isa_sweep_n$N/build.log" ) | tee -a $LOG &
+done; wait
 for N in $NS; do [[ -x wvsplitk_sweep_n$N ]] || { echo "build for N=$N failed, see isa_sweep_n$N/build.log"; exit 1; }; done
 for N in $NS; do
   echo "--- N=$N $(date)" | tee -a $LOG
   (amd-smi metric -u 2>/dev/null | grep -m1 GFX_ACTIVITY || true) | tee -a $LOG   # should be ~0%
   ./wvsplitk_sweep_n$N --shapes "$SHAPES" --rounds $ROUNDS --target-ms $TMS \
-      --csv sweep_${ARCH}_general_n$N.csv >> $LOG 2>&1
+      --csv sweep_${ARCH}_general_n$N.csv 2>&1 | tee -a $LOG
 done
 echo "done $(date)" | tee -a $LOG

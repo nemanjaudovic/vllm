@@ -21,6 +21,13 @@ struct Variant {
   Launcher launch;
 };
 
+#ifdef DOT_ONLY_BUILD
+// dot-only build: only what any current vllm gfx1x rule can pick (WvPrGrp 16, UNRL <= 4)
+template <int ND, int YT, int U>
+void add_wv(std::vector<Variant>& v) {
+  if constexpr (U <= 4) v.push_back({"", ND, YT, U, 16, make_launcher<ND, YT, U, 16, SWEEP_N>()});
+}
+#else
 template <int ND, int YT, int U>
 void add_wv(std::vector<Variant>& v) {
   v.push_back({"", ND, YT, U, 2, make_launcher<ND, YT, U, 2, SWEEP_N>()});
@@ -28,6 +35,7 @@ void add_wv(std::vector<Variant>& v) {
   v.push_back({"", ND, YT, U, 8, make_launcher<ND, YT, U, 8, SWEEP_N>()});
   v.push_back({"", ND, YT, U, 16, make_launcher<ND, YT, U, 16, SWEEP_N>()});
 }
+#endif
 template <int ND, int YT>
 void add_u(std::vector<Variant>& v) {
   add_wv<ND, YT, 1>(v); add_wv<ND, YT, 2>(v); add_wv<ND, YT, 4>(v); add_wv<ND, YT, 8>(v);

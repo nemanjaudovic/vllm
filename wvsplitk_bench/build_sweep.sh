@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the config sweep for one batch size N (1..5).
 #   ./build_sweep.sh <N> [arch]      arch default: detected via offload-arch / rocminfo, else gfx1100
+# SWEEP_FLAGS=-DDOT_ONLY_BUILD: only the 16-wave configs vllm picks today (fast build, for --dot-only).
 # Re-extracts vllm's kernels first (set VLLM_SRC to point at another checkout's skinny_gemms.cu).
 set -e
 cd "$(dirname "$0")"
@@ -11,7 +12,7 @@ HIPCC=${HIPCC:-$(command -v hipcc || echo /opt/python/lib/python3.14/site-packag
 # SKIP_EXTRACT=1: caller already ran extract_kernels.sh (parallel builds must not race on it)
 [[ -n "$SKIP_EXTRACT" ]] || ./extract_kernels.sh ${VLLM_SRC:-}
 mkdir -p isa_sweep_n$N
-(cd isa_sweep_n$N && $HIPCC -O3 -std=c++17 --offload-arch=$ARCH -DSWEEP_N=$N --save-temps \
+(cd isa_sweep_n$N && $HIPCC -O3 -std=c++17 --offload-arch=$ARCH -DSWEEP_N=$N $SWEEP_FLAGS --save-temps \
    -Rpass-analysis=kernel-resource-usage -o ../wvsplitk_sweep_n$N ../wvsplitk_sweep.hip > build.log 2>&1 \
    || { grep -E "error" build.log | head; exit 1; })
 # per-instantiation VGPR / spill / occupancy / LDS summary

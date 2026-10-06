@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -288,6 +289,11 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+# TUNING EXPERIMENT: WVSPLITK_CU_COUNT overrides the wvSplitK launch grid (number of
+# workgroups). Default is num_compute_units(), which is WGPs (48) on a W7900.
+_WVSPLITK_CU_COUNT = int(os.environ.get("WVSPLITK_CU_COUNT", "0"))
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -349,7 +355,7 @@ def rocm_unquantized_gemm_impl(
         # Note: Only build that view inside the branches that consume it.
         if (m == 1 or m > 8) and 0 < n <= 5:
             x_view = x.reshape(-1, x.size(-1)).contiguous()
-            cu_count = num_compute_units()
+            cu_count = _WVSPLITK_CU_COUNT or num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
         elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:

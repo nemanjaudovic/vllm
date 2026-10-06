@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 
 #include <stdexcept>
+#include <cstdlib>
 #include <algorithm>
 #include <map>
 #include <mutex>
@@ -83,6 +84,16 @@ bool on_gfx1151() {
     const auto* dprops = at::cuda::getCurrentDeviceProperties();
     const std::string device_arch = dprops->gcnArchName;
     return device_arch.find("gfx1151") != std::string::npos;
+  }();
+  return result;
+}
+
+// TUNING EXPERIMENT: WVSPLITK_TUNE=<YTILE><UNRL> (e.g. 24) forces one wvSplitK
+// tile config on gfx1x; unset or 0 keeps the normal heuristic. Read once per process.
+int wvsplitk_tune_cfg() {
+  static const int result = [] {
+    const char* s = std::getenv("WVSPLITK_TUNE");
+    return s ? std::atoi(s) : 0;
   }();
   return result;
 }
@@ -1262,7 +1273,22 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 //   N      = batch size (passed through from the switch in wvSplitK)
 #define WVSPLIT_TILE(_sYT, __N)                                             \
   {                                                                         \
-    if (on_gfx1151()) {                                                     \
+    if (on_gfx1x() && wvsplitk_tune_cfg() != 0) {                           \
+      switch (wvsplitk_tune_cfg()) {                                        \
+        case 11: WVSPLITK_CFG(32, 16, 1, 1, __N) break;                     \
+        case 12: WVSPLITK_CFG(32, 16, 1, 2, __N) break;                     \
+        case 14: WVSPLITK_CFG(32, 16, 1, 4, __N) break;                     \
+        case 21: WVSPLITK_CFG(32, 16, 2, 1, __N) break;                     \
+        case 22: WVSPLITK_CFG(32, 16, 2, 2, __N) break;                     \
+        case 24: WVSPLITK_CFG(32, 16, 2, 4, __N) break;                     \
+        case 41: WVSPLITK_CFG(32, 16, 4, 1, __N) break;                     \
+        case 42: WVSPLITK_CFG(32, 16, 4, 2, __N) break;                     \
+        case 44: WVSPLITK_CFG(32, 16, 4, 4, __N) break;                     \
+        default:                                                            \
+          throw std::runtime_error("unsupported WVSPLITK_TUNE value: " +    \
+                                   std::to_string(wvsplitk_tune_cfg()));    \
+      }                                                                     \
+    } else if (on_gfx1151()) {                                              \
       bool fit_lds = (Kbp_in * N_in <= max_lds_len);                        \
       if (_sYT <= 1)                                                        \
         WVSPLITK_CFG(/*THRDS=*/32, /*WVPRGRP=*/16, /*YTILE=*/1, /*UNRL=*/4, \

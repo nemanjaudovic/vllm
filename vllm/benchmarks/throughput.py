@@ -34,6 +34,75 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.async_utils import merge_async_iterators
 
 
+class _RoctxRange:
+    """Optional roctx range for rocprofv3 (no-op unless VLLM_BENCH_ROCTX=1).
+
+    Pushes/pops a named roctx range (visible with --marker-trace). With
+    collect=True it also calls roctxProfilerResume/Pause around the range, so
+    `rocprofv3 --selected-regions` records only that region.
+
+    Uses ctypes against librocprofiler-sdk-roctx because the pip ROCm SDK has no
+    roctx Python module for this interpreter, and libroctx64 lacks
+    roctxProfilerPause/Resume. Override the library with ROCTX_LIB.
+    """
+
+    _lib = None
+    _tried = False
+
+    def __init__(self, name: str, collect: bool = False):
+        self.name = name
+        self.collect = collect
+
+    @classmethod
+    def _load(cls):
+        if cls._tried:
+            return cls._lib
+        cls._tried = True
+        if os.environ.get("VLLM_BENCH_ROCTX", "0") != "1":
+            return None
+        import ctypes
+        import glob
+        import sys
+
+        cands = [os.environ.get("ROCTX_LIB", "")]
+        for sp in sys.path:
+            cands += glob.glob(
+                os.path.join(sp, "_rocm_sdk_*", "lib", "librocprofiler-sdk-roctx.so*")
+            )
+        for c in cands:
+            if c and os.path.exists(c):
+                lib = ctypes.CDLL(c)
+                lib.roctxRangePushA.argtypes = [ctypes.c_char_p]
+                lib.roctxRangePushA.restype = ctypes.c_int
+                lib.roctxRangePop.restype = ctypes.c_int
+                lib.roctxProfilerResume.argtypes = [ctypes.c_uint64]
+                lib.roctxProfilerPause.argtypes = [ctypes.c_uint64]
+                cls._lib = lib
+                print(f"[roctx] using {c}", flush=True)
+                return lib
+        print(
+            "[roctx] VLLM_BENCH_ROCTX=1 but roctx library not found; markers disabled",
+            flush=True,
+        )
+        return None
+
+    def __enter__(self):
+        lib = self._load()
+        if lib is not None:
+            if self.collect:
+                lib.roctxProfilerResume(0)
+            lib.roctxRangePushA(self.name.encode())
+        return self
+
+    def __exit__(self, *exc):
+        lib = self._load()
+        if lib is not None:
+            lib.roctxRangePop()
+            if self.collect:
+                lib.roctxProfilerPause(0)
+        return False
+
+
 def run_vllm(
     requests: list[SampleRequest],
     n: int,
@@ -215,23 +284,25 @@ def run_vllm_chat(
 
     if warmup_requests:
         print(f"Warming up with {len(warmup_requests)} requests...")
-        _run_vllm_chat_requests(
+        with _RoctxRange("phase_warmup"):
+            _run_vllm_chat_requests(
+                llm,
+                warmup_requests,
+                n,
+                disable_detokenize,
+                do_profile=False,
+                prequeue_requests=prequeue_requests,
+            )
+
+    with _RoctxRange("phase_benchmark", collect=True):
+        return _run_vllm_chat_requests(
             llm,
-            warmup_requests,
+            requests,
             n,
             disable_detokenize,
-            do_profile=False,
+            do_profile=do_profile,
             prequeue_requests=prequeue_requests,
         )
-
-    return _run_vllm_chat_requests(
-        llm,
-        requests,
-        n,
-        disable_detokenize,
-        do_profile=do_profile,
-        prequeue_requests=prequeue_requests,
-    )
 
 
 def _run_vllm_chat_requests(

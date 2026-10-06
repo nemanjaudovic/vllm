@@ -138,4 +138,17 @@ N=1 general grid (117 shapes; geomean slowdown vs per-shape best):
   prefers YTILE 1 with 8-16 waves (`nd_y1u8w16`).
 - Qwen3.5-9B weighted (sweep_report.py): N=1 `nd_y4u4w2` -3.4%, N=2 `nd_y4u4w2` -4.7%,
   N=3 `nd_y2u4w4` -3.8% GEMV time vs default.
-- N=2..5 general results: `results/gfx1100_w7900/general_n<N>.csv` once pushed.
+- General grid, all N (geomean vs oracle; `results/gfx1100_w7900/general_n<N>.csv`):
+
+  | N | vllm default (worst) | best single config | one config per K | per (K, M class) |
+  |---|---|---|---|---|
+  | 1 | 1.040 (1.20) | 1.009 `nd_y1u2w8` | 1.004 (6 cfgs) | 1.001 (17) |
+  | 2 | 1.076 (1.41) | 1.010 `nd_y1u2w8` | 1.005 (7) | 1.001 (14) |
+  | 3 | 1.074 (1.41) | 1.010 `nd_y1u4w16` | 1.005 (6) | 1.001 (15) |
+  | 4 | 1.093 (1.45) | 1.009 `nd_y1u4w8` | 1.005 (5) | 1.001 (12) |
+  | 5 | 1.081 (1.43) | 1.010 `nd_y1u4w8` | 1.006 (5) | 1.001 (13) |
+
+- Native dot vs fp32 dot at the same config (geomean over shapes): N=1: -1.3% at 16 waves,
+  -16% at 2 waves; N=4: -9% at 16 waves, -27% at 2 waves. Low-wave configs are only competitive
+  with the native dot. Best-nd vs best-fp per shape: -0.4% (N=1) to -1.2% (N=4).
+  Max relative error vs the fp32 reference is identical for nd and fp (bitwise diff not measured).

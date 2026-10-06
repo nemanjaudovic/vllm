@@ -7,6 +7,7 @@
 //
 //   ./build_sweep.sh <N>        -> ./wvsplitk_sweep_n<N>
 //   ./wvsplitk_sweep_n<N> [--shapes MxK[xcalls],...] [--rounds 3] [--csv out.csv] [--cu C]
+//                         [--only v1,v2] [--target-ms 20]
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -205,6 +206,7 @@ int main(int argc, char** argv) {
       {248320, 4096, 1}, {24576, 4096, 32}, {12288, 4096, 24},
       {10240, 4096, 8},  {4096, 12288, 32}, {4096, 4096, 32}};
   int rounds = 3, rot_mb = 1536, cu = 0;
+  double target_ms = 20;  // timed-loop length per measurement
   std::string csv = "sweep_n" + std::to_string(N) + ".csv", only;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -212,6 +214,7 @@ int main(int argc, char** argv) {
     if (a == "--rounds") rounds = atoi(nxt().c_str());
     else if (a == "--rot-mb") rot_mb = atoi(nxt().c_str());
     else if (a == "--cu") cu = atoi(nxt().c_str());
+    else if (a == "--target-ms") target_ms = atof(nxt().c_str());
     else if (a == "--csv") csv = nxt();
     else if (a == "--only") only = nxt();  // comma list of variant names
     else if (a == "--shapes") {
@@ -281,7 +284,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < rounds; r++)  // rounds interleave variants to cancel thermal/clock drift
       for (size_t i = 0; i < vars.size(); i++) {
         if (err[i] < 0) continue;
-        int iters = std::clamp((int)(20.0 / std::max(est[i], 1e-3)), 10, 200);  // ~20 ms
+        int iters = std::clamp((int)(target_ms / std::max(est[i], 1e-3)), 10, 200);
         int c = 0;
         for (int w = 0; w < 5; w++) vars[i].launch(W[c++ % nb], x, y, M, K, cu);
         CHECK(hipEventRecord(e0));

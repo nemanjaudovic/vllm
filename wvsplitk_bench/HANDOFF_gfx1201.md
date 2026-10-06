@@ -1,9 +1,10 @@
 # Handoff: tune vLLM's wvSplitK skinny GEMV for gfx1201 (RDNA4)
 
 You are continuing a kernel-tuning effort started on a Radeon Pro W7900 (gfx1100). Your job: run the
-same config sweep on **gfx1201** with the harness in this directory, using the vllm checkout the user
-gives you (branch `gfx11-wvsplitk-tuning` of github.com/nemanjaudovic/vllm), and turn the results into
-per-N tile rules for gfx1201. Do not change the harness methodology without telling the user;
+same **model-agnostic** config sweep on **gfx1201** with the harness in this directory, using the vllm
+checkout the user gives you (branch `gfx11-wvsplitk-tuning` of github.com/nemanjaudovic/vllm), and turn
+the results into per-N tile rules for gfx1201 (like gfx1151's in PR #40784). Start with N=1 only, report,
+then do N=2..5. Do not change the harness methodology without telling the user;
 gfx1100 and gfx1201 results must stay comparable.
 
 ## 1. Background
@@ -61,63 +62,80 @@ n = tokens, m = out_features, k = in_features.
 | file | purpose |
 |---|---|
 | `extract_kernels.sh` | copies vllm's real kernels (sml/hf/big, min__, mindiv) out of `../csrc/rocm/skinny_gemms.cu` into `vllm_kernels.inc`, minus DOT2C |
-| `wvsplitk_sweep.hip` | compiles them twice (`fp_` = current dot, `nd_` = native dot); grid YTILE {1,2,3,4} x UNRL {1,2,4,8} x WvPrGrp {2,4,8,16} = 128 variants; vllm's sml/hf/big dispatch; fp32 reference check; weights rotated over >= 1.5 GB so every call reads DRAM; median of interleaved rounds |
-| `build_sweep.sh N [arch]` | builds `wvsplitk_sweep_n<N>` (~80 s on the gfx1100 box), writes `isa_sweep_n<N>/resources.txt` (VGPR/scratch per instantiation) |
-| `sweep_report.py` | per N: vllm default vs best single config vs best per shape, plus the top configs |
-| `wvsplitk_bench.hip`, `build.sh` | older N=1 experiments (pipelined loads, WGs per WGP); not needed for the sweep |
-| `results/gfx1100_w7900/` | reference CSVs, N=1..3 |
+| `wvsplitk_sweep.hip` | compiles them twice (`fp_` = current dot, `nd_` = native dot); grid YTILE {1,2,3,4} x UNRL {1,2,4,8} x WvPrGrp {2,4,8,16} = 128 variants; vllm's sml/hf/big dispatch; fp32 reference check; weights rotated over >= 1.5 GB so every call reads DRAM; median of interleaved rounds. Flags: `--shapes MxK[xcalls],...`, `--only v1,v2`, `--rounds`, `--target-ms`, `--csv`, `--cu` |
+| `build_sweep.sh N [arch]` | builds `wvsplitk_sweep_n<N>`, writes `isa_sweep_n<N>/resources.txt` (VGPR/scratch per instantiation). gfx1100 box: ~80 s for N=1, ~15 min link for N=5 (spilling configs) |
+| `general_sweep.sh [arch] [Ns] [rounds] [target_ms]` | **main entry point**: builds the given N in parallel, runs each on the 117-shape grid in `general_shapes.txt`, logs to `general_sweep_<arch>.log`, writes `sweep_<arch>_general_n<N>.csv` |
+| `general_shapes.txt` | M x K grid: K {1024,1536,2048,2560,3072,4096,5120,6144,8192,12288,14336,16384} x M {1024,2048,4096,6144,8192,12288,16384,28672,65536,151936}, weights capped at 2.6 GB |
+| `rule_explorer.py` | **main analysis**: every shape weighted equally, configs ranked by geomean slowdown vs the per-shape best. Shows the vllm default vs best single config vs rule families (per K, per (K, M class), per (kernel, M class)) vs the oracle, a robust shortlist, and with `--maps` K x M winner/loss maps |
+| `sweep_report.py` | per-model view: shapes weighted by calls per decode step (default shapes = Qwen3.5-9B) |
+| `wvsplitk_bench.hip`, `build.sh` | older N=1 experiments (pipelined loads, WGs per WGP); not needed |
+| `results/gfx1100_w7900/` | reference: `general_n<N>.csv` (general grid), `qwen_n<N>.csv` (Qwen3.5-9B shapes) |
 
 Variant names: `nd_y4u4w2` = native dot, YTILE 4, UNRL 4, 2 waves per WG.
 
 ## 5. What to run on gfx1201
 
-0. Check the environment and record it in your report: `rocminfo | grep -m1 gfx`, GPU name, the
-   CuCount the harness prints, ROCm/hipcc version. Make sure the GPU is idle:
+0. Environment, recorded in your report: `rocminfo | grep -m1 gfx`, GPU name, the CuCount the
+   harness prints, ROCm/hipcc version, free VRAM (needs ~6 GB). Make sure the GPU is idle:
    `amd-smi metric -u` (GFX activity ~0) and no other jobs. Background load moved results ~1% on gfx1100.
    If `hipcc` is not on PATH: `export HIPCC=/path/to/hipcc`.
-1. Sanity check the native dot on gfx12: after building, grep the generated ISA in
-   `isa_sweep_n1/*.s` for `v_dot2_f32_bf16`. If it is missing, the `nd_` variants are not what
-   they claim to be. Stop and report.
-2. Primary sweep (Qwen3.5-9B shapes, weighted by calls per decode step; this is the default set):
+1. N=1 general sweep (gfx1100 took ~10 min):
    ```bash
    cd wvsplitk_bench
-   for N in 1 2 3 4 5; do
-     ./build_sweep.sh $N gfx1201 && ./wvsplitk_sweep_n$N --rounds 3 --csv sweep_gfx1201_n$N.csv
-   done
-   python3 sweep_report.py sweep_gfx1201_n*.csv --top 8
+   ./general_sweep.sh gfx1201 1
+   python3 rule_explorer.py sweep_gfx1201_general_n1.csv --maps
    ```
-   Any `WRONG RESULT` line means a correctness bug. Report it; never ignore it.
-3. Generalization sweep. Rules must not be fit to 6 shapes. Run every N on a broader shape set
-   (representative decode shapes of Llama-3.1-8B, Qwen3-14B, Qwen3-1.7B; MxK):
-   ```bash
-   S=6144x4096,4096x4096,28672x4096,4096x14336,128256x4096,7168x5120,5120x5120,34816x5120,5120x17408,151936x5120,4096x2048,2048x2048,12288x2048,2048x6144,151936x2048
-   ./wvsplitk_sweep_n$N --shapes $S --rounds 3 --csv sweep_gfx1201_broad_n$N.csv
-   python3 sweep_report.py sweep_gfx1201_broad_n*.csv --unweighted
-   ```
-4. Copy the finished CSVs to `results/gfx1201_<card>/` and commit them (ask the user before pushing).
-5. Optional, gives a roof to compare against: if Triton is available, the pure-read roof script
-   from the gfx1100 box (`read_roof.py`; ask the user for it) at the same byte sizes.
+   Then check the native dot on gfx12: grep `isa_sweep_n1/*.s` for `v_dot2_f32_bf16`. If it is
+   missing, the `nd_` variants aren't what they claim to be. Stop and report.
+   Any `WRONG RESULT` in `general_sweep_gfx1201.log` is a correctness bug. Report it, never ignore it.
+   **Stop here and report N=1 to the user** (see section 6) before continuing.
+2. N=2..5: `./general_sweep.sh gfx1201 "2 3 4 5"` (~1 h+), then
+   `python3 rule_explorer.py sweep_gfx1201_general_n*.csv --maps`.
+3. Optional, Qwen3.5-9B view (the user's real workload): `./wvsplitk_sweep_n$N --rounds 3 --csv
+   sweep_gfx1201_qwen_n$N.csv` for each built N, then `python3 sweep_report.py sweep_gfx1201_qwen_n*.csv`.
+4. Copy finished CSVs to `results/gfx1201_<card>/` as `general_n<N>.csv` / `qwen_n<N>.csv` and
+   commit. Ask the user before pushing.
 
-## 6. What to report back
+## 6. What to report back (compare with gfx1100 in section 8)
 
-- Per N: vllm default, best single config, and best per shape (ms and %), and whether the winners
-  match gfx1100's (N=1 `nd_y4u4w2` -3.4%; N=2 `nd_y4u4w2` -4.7%; N=3 `nd_y2u4w4` -3.8%).
+- Per N: rule_explorer's summary block (default / single / rule families / oracle) and the shortlist.
 - Does "fewer waves + deeper loads" hold on gfx1201? Does the native dot help?
-- Which shape features (K, M, N, the sml/hf/big kernel) change the winner. These become rule
-  conditions.
+- Which features change the winner: K (look at the power-of-2 vs K%1024==512 rows), M (few rounds
+  vs many), N, and the sml/hf/big kernel. These become rule conditions.
 - A draft `else if (on_gfx12())` branch for `WVSPLIT_TILE` in gfx1151 style: few rules, each
-  justified by the sweep, with the gain of the rules vs best-per-shape. Prefer simple rules;
-  per-shape tuning was only 0.3-0.9% better than a single config on gfx1100.
+  justified by the maps. Report its geomean vs the oracle and vs the default. Prefer 3-6 rules over
+  a per-shape table; on gfx1100 one config per K (6 configs) already reached 1.004 vs oracle.
 
 ## 7. Known gaps / open questions
 
 - The config grid is complete relative to gfx1151's rules: their configs are all subsets of
   YTILE {1,2,4} x UNRL {1,2,4} at 16 waves. Not swept: grid size (WGs per WGP; no gain on gfx1100)
   and LDS size (fixed 64 KB, hardware max per WG).
-- N=4-5 at K=12288 use `wvSplitK_hf_big_`, which re-stages x through LDS with barriers on every row
+- N=4-5 at large K use `wvSplitK_hf_big_`, which re-stages x through LDS with barriers on every row
   round. Hypothesis: the `hf_` path (tail of x from L2) would be faster. A `--force-kernel` option
   to test this is not implemented yet.
-- Hypothesis for why fewer waves win: fewer concurrent weight-row streams means better DRAM page
-  and channel locality. Not verified with counters.
 - Nothing has been ported into vllm's dispatch yet, and there is no end-to-end number yet for any
-  arch. Expected on gfx1100: ~+2-3% output tok/s for the single-user benchmark.
+  arch. Expected on gfx1100: ~+2-3% output tok/s for the single-user Qwen benchmark.
+
+## 8. gfx1100 (W7900, CuCount 48) reference results
+
+N=1 general grid (117 shapes; geomean slowdown vs per-shape best):
+
+| | geomean | worst shape |
+|---|---|---|
+| vllm default (`fp_y2u2w16` etc.) | 1.040 | 1.203 (K=3072, M=1024) |
+| best single config `nd_y1u2w8` | 1.009 | 1.049 |
+| one config per K (6 distinct) | 1.004 | 1.033 |
+| one config per (K, M class) (17 distinct) | 1.001 | 1.007 |
+
+- The native dot (`nd_`) wins almost every shape.
+- The default is within ~2% of best only at K=1536 and 2560 (K%1024==512, the
+  only K whose row stride is not a multiple of 2 KB). At power-of-2-ish K it loses 4-20%, worst at
+  small M. Hypothesis: many concurrent row streams with power-of-2 strides collide on DRAM channels.
+  Fewer/deeper streams avoid it. Unverified with counters. Check whether gfx1201 shows the same K
+  pattern.
+- Large M (many row rounds) prefers YTILE 3-4 with 2 waves (`nd_y4u4w2`, `nd_y3u8w2`); small M
+  prefers YTILE 1 with 8-16 waves (`nd_y1u8w16`).
+- Qwen3.5-9B weighted (sweep_report.py): N=1 `nd_y4u4w2` -3.4%, N=2 `nd_y4u4w2` -4.7%,
+  N=3 `nd_y2u4w4` -3.8% GEMV time vs default.
+- N=2..5 general results: `results/gfx1100_w7900/general_n<N>.csv` once pushed.

@@ -8,7 +8,8 @@ N=${1:?usage: build_sweep.sh <N> [arch]}
 ARCH=${2:-$( (offload-arch 2>/dev/null || rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' ) | head -1)}
 ARCH=${ARCH:-gfx1100}
 HIPCC=${HIPCC:-$(command -v hipcc || echo /opt/python/lib/python3.14/site-packages/_rocm_sdk_devel/bin/hipcc)}
-./extract_kernels.sh ${VLLM_SRC:-}
+# SKIP_EXTRACT=1: caller already ran extract_kernels.sh (parallel builds must not race on it)
+[[ -n "$SKIP_EXTRACT" ]] || ./extract_kernels.sh ${VLLM_SRC:-}
 mkdir -p isa_sweep_n$N
 (cd isa_sweep_n$N && $HIPCC -O3 -std=c++17 --offload-arch=$ARCH -DSWEEP_N=$N --save-temps \
    -Rpass-analysis=kernel-resource-usage -o ../wvsplitk_sweep_n$N ../wvsplitk_sweep.hip > build.log 2>&1 \

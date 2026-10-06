@@ -30,6 +30,10 @@ for (arch, N), rs in sorted(byN.items()):
         if r["is_vllm_default"] == "1":
             default[mk] = r["variant"]
         kern[(r["variant"], mk)] = r["kernel"]
+    missing = [mk for mk in shapes if default.get(mk) not in t or mk not in t[default[mk]]]
+    if missing:
+        print(f"\n=== {arch}  N={N}: vllm default config missing for {missing} (run without --only); skipped")
+        continue
     complete = {v: d for v, d in t.items() if len(d) == len(shapes)}
     tot = lambda v: sum(complete[v][mk] * c for mk, c in shapes.items())
     dtot = sum(t[default[mk]][mk] * c for mk, c in shapes.items())

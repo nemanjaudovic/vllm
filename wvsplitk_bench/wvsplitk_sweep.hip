@@ -305,9 +305,13 @@ int main(int argc, char** argv) {
       if (ok && us < best_us) best_us = us, best = v.name;
       if (!ok) printf("  WRONG RESULT %s %dx%d err %.2e\n", v.name.c_str(), M, K, err[i]);
     }
-    printf("%7dx%-6d N=%d  vllm(%s) %8.1f us  best %-14s %8.1f us  %+5.1f%%  [kernel %s]\n", M, K,
-           N, def.c_str(), def_us, best.c_str(), best_us, 100 * (best_us - def_us) / def_us,
-           kernel_for(M, K, N, 2));
+    if (def_us > 0)
+      printf("%7dx%-6d N=%d  vllm(%s) %8.1f us  best %-14s %8.1f us  %+5.1f%%  [kernel %s]\n", M,
+             K, N, def.c_str(), def_us, best.c_str(), best_us, 100 * (best_us - def_us) / def_us,
+             kernel_for(M, K, N, 2));
+    else  // default config excluded by --only
+      printf("%7dx%-6d N=%d  vllm(%s) not run          best %-14s %8.1f us  [kernel %s]\n", M, K,
+             N, def.c_str(), best.c_str(), best_us, kernel_for(M, K, N, 2));
     fflush(f);
     for (auto p : W) CHECK(hipFree(p));
     CHECK(hipFree(x)); CHECK(hipFree(y)); CHECK(hipFree(yref));

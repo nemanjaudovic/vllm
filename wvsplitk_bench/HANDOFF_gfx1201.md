@@ -170,3 +170,6 @@ gfx1100 results: `results/gfx1100_w7900/dotonly_n1.csv` (-1.19% geomean, worst +
 (mean 0.25 ulp, >=99.9% bitwise equal). Two differences: it **flushes fp32-denormal results**
 (outputs below ~1e-38 become 0) and is slightly worse under heavy cancellation (fp32 path closer in
 ~1.7% of outputs in the `cancel` set).
+The zero-accumulator form (`nz`: `acc += v_dot2(a, b, 0)`) was tested to reproduce the fp32 rounding
+and is worse (cancel set: mean 0.675 ulp, fp32 closer in 11%), so the instruction's internal rounding
+is coarser than an exact fp32 sum; keeping the accumulator inside the instruction (`nd`) hides it.

@@ -1,5 +1,5 @@
-// Shared by wvsplitk_sweep.hip and wvsplitk_accuracy.hip: vllm kernels (fp32-dot and native-dot
-// builds), vllm host-side dispatch rules, launch helpers.
+// Shared by wvsplitk_sweep.hip and wvsplitk_accuracy.hip: vllm kernels (fp32-dot, native-dot and
+// native-dot-zero-acc builds), vllm host-side dispatch rules, launch helpers.
 #pragma once
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -67,7 +67,22 @@ namespace nativedot {
 #undef DOT2C
 }  // namespace nativedot
 
+// native dot with a zero accumulator, then a separate fp32 add: the dot rounds a.x*b.x + a.y*b.y once
+// (products are exact), then acc += -- the same rounding sequence as the fp32 path above
+namespace nativedot0 {
+#define DOT2C(V0, V2, V3)                                                               \
+  if constexpr (std::is_same_v<scalar_t, half>) {                                       \
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3));                 \
+  } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {                      \
+    V0 += __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2_t, V2),             \
+                                          __builtin_bit_cast(bf16x2_t, V3), 0.0f, false); \
+  }
+#include "vllm_kernels.inc"
+#undef DOT2C
+}  // namespace nativedot0
+
 using bf16 = __hip_bfloat16;
+const char* const DOT_PREFIX[3] = {"fp", "nd", "nz"};
 constexpr int MAX_LDS_LEN = LDS_SIZE / 2;  // elements, as in vllm host code
 
 // vllm's mindiv with a guard for WvPrGrp < 13 (vllm's version divides by <= 0 there)
@@ -91,7 +106,8 @@ const char* kernel_for(int M, int K, int N, int YT) {
 // W: MxK weight, x: NxK activation, y: NxM output
 using Launcher = std::function<void(const bf16* W, const bf16* x, bf16* y, int M, int K, int cu)>;
 
-template <bool ND, int YT, int U, int WV, int N>
+// DOT: 0 = fp32 path (vllm today), 1 = native dot, 2 = native dot with zero acc + separate add
+template <int DOT, int YT, int U, int WV, int N>
 Launcher make_launcher() {
   return [](const bf16* W, const bf16* x, bf16* y, int M, int K, int cu) {
     int wv = mindiv_safe(M, cu * YT, WV);
@@ -108,7 +124,7 @@ Launcher make_launcher() {
   else                                                                                          \
     NS::wvSplitK_hf_big_<bf16, 32, YT, WV, 8, U, N>                                             \
         <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);
-    if constexpr (ND) { LAUNCH(nativedot) } else { LAUNCH(fp32dot) }
+    if constexpr (DOT == 1) { LAUNCH(nativedot) } else if constexpr (DOT == 2) { LAUNCH(nativedot0) } else { LAUNCH(fp32dot) }
 #undef LAUNCH
   };
 }

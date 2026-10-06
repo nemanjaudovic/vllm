@@ -16,32 +16,34 @@
 
 struct Variant {
   std::string name;
-  bool dot;
+  int dot;  // 0 fp, 1 nd, 2 nz
   int yt, u, wv;
   Launcher launch;
 };
 
-template <bool ND, int YT, int U>
+template <int ND, int YT, int U>
 void add_wv(std::vector<Variant>& v) {
   v.push_back({"", ND, YT, U, 2, make_launcher<ND, YT, U, 2, SWEEP_N>()});
   v.push_back({"", ND, YT, U, 4, make_launcher<ND, YT, U, 4, SWEEP_N>()});
   v.push_back({"", ND, YT, U, 8, make_launcher<ND, YT, U, 8, SWEEP_N>()});
   v.push_back({"", ND, YT, U, 16, make_launcher<ND, YT, U, 16, SWEEP_N>()});
 }
-template <bool ND, int YT>
+template <int ND, int YT>
 void add_u(std::vector<Variant>& v) {
   add_wv<ND, YT, 1>(v); add_wv<ND, YT, 2>(v); add_wv<ND, YT, 4>(v); add_wv<ND, YT, 8>(v);
 }
-template <bool ND>
+template <int ND>
 void add_yt(std::vector<Variant>& v) {
   add_u<ND, 1>(v); add_u<ND, 2>(v); add_u<ND, 3>(v); add_u<ND, 4>(v);
 }
 std::vector<Variant> make_variants() {
   std::vector<Variant> v;
-  add_yt<false>(v);
-  add_yt<true>(v);
+  add_yt<0>(v);
+  add_yt<1>(v);
+  // dot mode 2 (nz: zero-acc native dot + add) is in wvsplitk_accuracy only: it is less accurate
+  // than both fp and nd under cancellation (results/gfx1100_w7900/accuracy.csv), so not a candidate
   for (auto& x : v)
-    x.name = std::string(x.dot ? "nd" : "fp") + "_y" + std::to_string(x.yt) + "u" +
+    x.name = std::string(DOT_PREFIX[x.dot]) + "_y" + std::to_string(x.yt) + "u" +
              std::to_string(x.u) + "w" + std::to_string(x.wv);
   return v;
 }
@@ -130,7 +132,7 @@ int main(int argc, char** argv) {
     // correctness + rough time per call (to size the timed loop)
     std::vector<double> err(vars.size(), -1), est(vars.size());
     for (size_t i = 0; i < vars.size(); i++) {
-      if (dot_only && vars[i].name != def && vars[i].name != "nd_" + def.substr(3)) continue;
+      if (dot_only && vars[i].name.substr(3) != def.substr(3)) continue;  // fp/nd/nz of the default
       CHECK(hipMemset(y, 0xff, hy.size() * 2));
       vars[i].launch(W[0], x, y, M, K, cu);
       if (hipGetLastError() != hipSuccess) continue;

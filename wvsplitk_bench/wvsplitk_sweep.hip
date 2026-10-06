@@ -7,120 +7,12 @@
 //
 //   ./build_sweep.sh <N>        -> ./wvsplitk_sweep_n<N>
 //   ./wvsplitk_sweep_n<N> [--shapes MxK[xcalls],...] [--rounds 3] [--csv out.csv] [--cu C]
-//                         [--only v1,v2] [--target-ms 20]
-#include <hip/hip_runtime.h>
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp16.h>
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <functional>
-#include <string>
-#include <type_traits>
-#include <vector>
+//                         [--only v1,v2] [--target-ms 20] [--dot-only]
+#include "wv_common.h"
 
 #ifndef SWEEP_N
   #define SWEEP_N 1
 #endif
-
-#define CHECK(x)                                                                    \
-  do {                                                                              \
-    hipError_t e_ = (x);                                                            \
-    if (e_ != hipSuccess) {                                                         \
-      fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, hipGetErrorString(e_));     \
-      exit(1);                                                                      \
-    }                                                                               \
-  } while (0)
-
-// ---- prelude: what vllm_kernels.inc expects from the top of skinny_gemms.cu ----
-#if defined(__GFX11__) || defined(__GFX12__)
-  #define __HIP__GFX1X__
-#endif
-#define LDS_SIZE 64 * 1024  // gfx11/gfx12
-#define UNREACHABLE_CODE assert(false);
-template <typename T>
-__device__ __forceinline__ T __float2s(float v);
-template <>
-__device__ __forceinline__ half __float2s(float v) { return __float2half(v); }
-template <>
-__device__ __forceinline__ __hip_bfloat16 __float2s(float v) { return __float2bfloat16(v); }
-template <typename T>
-__device__ __forceinline__ T loadnt(T* addr) { return __builtin_nontemporal_load(addr); }
-typedef __bf16 bf16x2_t __attribute__((ext_vector_type(2)));
-
-// ---- vllm kernels, twice: current fp32 bf16 dot, and native v_dot2_f32_bf16 ----
-namespace fp32dot {
-#define DOT2C(V0, V2, V3)                                               \
-  if constexpr (std::is_same_v<scalar_t, half>) {                       \
-    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
-  } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {      \
-    float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *       \
-               __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));        \
-    V0 += (s.x + s.y);                                                  \
-  }
-#include "vllm_kernels.inc"
-#undef DOT2C
-}  // namespace fp32dot
-
-namespace nativedot {
-#define DOT2C(V0, V2, V3)                                                               \
-  if constexpr (std::is_same_v<scalar_t, half>) {                                       \
-    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3));                 \
-  } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {                      \
-    V0 = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2_t, V2),              \
-                                         __builtin_bit_cast(bf16x2_t, V3), V0, false); \
-  }
-#include "vllm_kernels.inc"
-#undef DOT2C
-}  // namespace nativedot
-
-using bf16 = __hip_bfloat16;
-constexpr int MAX_LDS_LEN = LDS_SIZE / 2;  // elements, as in vllm host code
-
-// vllm's mindiv with a guard for WvPrGrp < 13 (vllm's version divides by <= 0 there)
-int mindiv_safe(int N, int div1, int div2) {
-  int nPrRnd = div1 * div2, n = std::min(13, div2), rnds[13];
-  for (int i = 0; i < n; i++) {
-    rnds[i] = (N + nPrRnd - 1) / nPrRnd;
-    nPrRnd -= div1;
-  }
-  for (int i = n - 1; i >= 0; i--)
-    if (rnds[0] == rnds[i]) return div2 - i;
-  return 0;
-}
-
-const char* kernel_for(int M, int K, int N, int YT) {
-  if (K * N <= MAX_LDS_LEN && M % YT == 0) return "sml";
-  if (K * N <= MAX_LDS_LEN * 1.2) return "hf";
-  return "big";
-}
-
-// W: MxK weight, x: NxK activation, y: NxM output
-using Launcher = std::function<void(const bf16* W, const bf16* x, bf16* y, int M, int K, int cu)>;
-
-template <bool ND, int YT, int U, int WV, int N>
-Launcher make_launcher() {
-  return [](const bf16* W, const bf16* x, bf16* y, int M, int K, int cu) {
-    int wv = mindiv_safe(M, cu * YT, WV);
-    dim3 grid(cu), block(32, WV);
-    std::string k = kernel_for(M, K, N, YT);
-    // args as in vllm: (K, Kap=W stride, Kbp=x stride, M, Bx, By, B=W, A=x, BIAS, C, wv, cu)
-#define LAUNCH(NS)                                                                              \
-  if (k == "sml")                                                                               \
-    NS::wvSplitK_hf_sml_<bf16, 32, YT, WV, 8, U, N>                                             \
-        <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);                          \
-  else if (k == "hf")                                                                           \
-    NS::wvSplitK_hf_<bf16, 32, YT, WV, 8, U, N>                                                 \
-        <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);                          \
-  else                                                                                          \
-    NS::wvSplitK_hf_big_<bf16, 32, YT, WV, 8, U, N>                                             \
-        <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);
-    if constexpr (ND) { LAUNCH(nativedot) } else { LAUNCH(fp32dot) }
-#undef LAUNCH
-  };
-}
 
 struct Variant {
   std::string name;
@@ -154,19 +46,6 @@ std::vector<Variant> make_variants() {
   return v;
 }
 
-// vllm's current gfx1x (non-gfx1151) choice: WVSPLIT_TILE_CFG(32, 16, sYT, N), fp32 dot
-std::string vllm_default(int M, int K, int N, int cu) {
-  int sYT = (M + cu * 4 - 1) / (cu * 4);
-  bool fit_lds = K * N <= MAX_LDS_LEN;
-  int yt, u;
-  if (sYT <= 1) yt = 1, u = 4;
-  else if (N == 1 || !fit_lds || sYT <= 8) yt = 2, u = 2;
-  else if (sYT <= 12) yt = 3, u = 2;
-  else if (N == 4) yt = 4, u = 1;
-  else yt = 4, u = 2;
-  return "fp_y" + std::to_string(yt) + "u" + std::to_string(u) + "w16";
-}
-
 __global__ void ref_gemv(const bf16* W, const bf16* x, float* y, int M, int K) {
   __shared__ float red[256];
   int row = blockIdx.x, n = blockIdx.y;
@@ -182,23 +61,6 @@ __global__ void ref_gemv(const bf16* W, const bf16* x, float* y, int M, int K) {
   if (threadIdx.x == 0) y[(size_t)n * M + row] = red[0];
 }
 
-__global__ void fill_rand(bf16* p, size_t n, uint32_t seed) {
-  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
-       i += (size_t)gridDim.x * blockDim.x) {
-    uint32_t h = (uint32_t)i * 2654435761u ^ seed;
-    h ^= h >> 13; h *= 0x5bd1e995; h ^= h >> 15;
-    p[i] = __float2bfloat16(((h & 0xffff) / 65535.f - 0.5f) * 0.1f);
-  }
-}
-
-std::vector<std::string> split(const std::string& s, char c) {
-  std::vector<std::string> out;
-  size_t a = 0, b;
-  while ((b = s.find(c, a)) != std::string::npos) { out.push_back(s.substr(a, b - a)); a = b + 1; }
-  if (a < s.size()) out.push_back(s.substr(a));
-  return out;
-}
-
 int main(int argc, char** argv) {
   const int N = SWEEP_N;
   // MxK x calls-per-decode-step (Qwen3.5-9B; replace with your model's shapes)
@@ -208,6 +70,7 @@ int main(int argc, char** argv) {
   int rounds = 3, rot_mb = 1536, cu = 0;
   double target_ms = 20;  // timed-loop length per measurement
   std::string csv = "sweep_n" + std::to_string(N) + ".csv", only;
+  bool dot_only = false;  // per shape: only vllm's current config, fp32 dot vs native dot
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto nxt = [&]() { return std::string(argv[++i]); };
@@ -217,6 +80,7 @@ int main(int argc, char** argv) {
     else if (a == "--target-ms") target_ms = atof(nxt().c_str());
     else if (a == "--csv") csv = nxt();
     else if (a == "--only") only = nxt();  // comma list of variant names
+    else if (a == "--dot-only") dot_only = true;
     else if (a == "--shapes") {
       shapes.clear();
       for (auto& s : split(nxt(), ',')) {
@@ -261,11 +125,12 @@ int main(int argc, char** argv) {
     CHECK(hipMemcpy(href.data(), yref, href.size() * 4, hipMemcpyDeviceToHost));
     double scale = 0;
     for (float v : href) scale = std::max(scale, (double)fabs(v));
-    std::string def = vllm_default(M, K, N, cu);
+    std::string def = vllm_default(M, K, N, cu, std::string(prop.gcnArchName).find("gfx1151") == 0);
 
     // correctness + rough time per call (to size the timed loop)
     std::vector<double> err(vars.size(), -1), est(vars.size());
     for (size_t i = 0; i < vars.size(); i++) {
+      if (dot_only && vars[i].name != def && vars[i].name != "nd_" + def.substr(3)) continue;
       CHECK(hipMemset(y, 0xff, hy.size() * 2));
       vars[i].launch(W[0], x, y, M, K, cu);
       if (hipGetLastError() != hipSuccess) continue;

@@ -152,3 +152,21 @@ N=1 general grid (117 shapes; geomean slowdown vs per-shape best):
   -16% at 2 waves; N=4: -9% at 16 waves, -27% at 2 waves. Low-wave configs are only competitive
   with the native dot. Best-nd vs best-fp per shape: -0.4% (N=1) to -1.2% (N=4).
   Max relative error vs the fp32 reference is identical for nd and fp (bitwise diff not measured).
+
+## 9. Native-bf16-dot-only PR: data to collect per arch (gfx1100 done, gfx1201, gfx1151)
+
+Speed: vllm's current tile config per shape (gfx1151 rules on gfx1151), fp32 dot vs native dot:
+```bash
+./dot_only_sweep.sh <arch> 1            # N=1 first (~1-2 min + build), then: ./dot_only_sweep.sh <arch> "2 3 4 5"
+```
+Accuracy vs fp64 (synthetic data sets + real Qwen3.5-9B weights):
+```bash
+./build_accuracy.sh <arch>
+W=$(python3 dump_weights.py Qwen/Qwen3.5-9B 'layers\.3\.(mlp|self_attn)\.(down|gate|up|q|o)_proj\.weight$' '^lm_head\.weight$' --out /tmp/wv_weights | grep -- --weights | cut -d' ' -f2)
+./wvsplitk_accuracy --weights $W --csv accuracy_<arch>.csv      # ~20 min, CPU-bound data generation
+```
+gfx1100 results: `results/gfx1100_w7900/dotonly_n1.csv` (-1.19% geomean, worst +0.1%),
+`results/gfx1100_w7900/accuracy.csv`. Native dot matches fp32 dot error on normal/outlier/real data
+(mean 0.25 ulp, >=99.9% bitwise equal). Two differences: it **flushes fp32-denormal results**
+(outputs below ~1e-38 become 0) and is slightly worse under heavy cancellation (fp32 path closer in
+~1.7% of outputs in the `cancel` set).

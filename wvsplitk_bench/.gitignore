@@ -10,3 +10,6 @@
 # vllm's root .gitignore ignores *.hip (hipify output) and *.csv; keep our sources and results
 !*.hip
 !results/**/*.csv
+/weights/
+/accuracy*.csv
+/wvsplitk_accuracy

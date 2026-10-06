@@ -7,7 +7,8 @@
 //
 //   ./build_sweep.sh <N>        -> ./wvsplitk_sweep_n<N>
 //   ./wvsplitk_sweep_n<N> [--shapes MxK[xcalls],...] [--rounds 3] [--csv out.csv] [--cu C]
-//                         [--only v1,v2] [--target-ms 20] [--dot-only]
+//                         [--only v1,v2] [--target-ms 20] [--dot-only] [--pad [elems]]
+//   --pad without a value = PR #55090 rule (row stride +64 elems when K*2 % 2048 == 0)
 #include "wv_common.h"
 
 #ifndef SWEEP_N
@@ -56,12 +57,12 @@ std::vector<Variant> make_variants() {
   return v;
 }
 
-__global__ void ref_gemv(const bf16* W, const bf16* x, float* y, int M, int K) {
+__global__ void ref_gemv(const bf16* W, const bf16* x, float* y, int M, int K, int ldw) {
   __shared__ float red[256];
   int row = blockIdx.x, n = blockIdx.y;
   float acc = 0.f;
   for (int k = threadIdx.x; k < K; k += blockDim.x)
-    acc += __bfloat162float(W[(size_t)row * K + k]) * __bfloat162float(x[(size_t)n * K + k]);
+    acc += __bfloat162float(W[(size_t)row * ldw + k]) * __bfloat162float(x[(size_t)n * K + k]);
   red[threadIdx.x] = acc;
   __syncthreads();
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -80,7 +81,8 @@ int main(int argc, char** argv) {
   int rounds = 3, rot_mb = 1536, cu = 0;
   double target_ms = 20;  // timed-loop length per measurement
   std::string csv = "sweep_n" + std::to_string(N) + ".csv", only;
-  bool dot_only = false;  // per shape: only vllm's current config, fp32 dot vs native dot
+  bool dot_only = false;
+  int pad_mode = -1;  // --pad: -1 none, 0 = vllm PR #55090 rule (64 elems if K*2 % 2048 == 0), >0 elems  // per shape: only vllm's current config, fp32 dot vs native dot
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto nxt = [&]() { return std::string(argv[++i]); };
@@ -91,6 +93,7 @@ int main(int argc, char** argv) {
     else if (a == "--csv") csv = nxt();
     else if (a == "--only") only = nxt();  // comma list of variant names
     else if (a == "--dot-only") dot_only = true;
+    else if (a == "--pad") pad_mode = (i + 1 < argc && argv[i + 1][0] != '-') ? atoi(argv[++i]) : 0;
     else if (a == "--shapes") {
       shapes.clear();
       for (auto& s : split(nxt(), ',')) {
@@ -110,26 +113,30 @@ int main(int argc, char** argv) {
                  return std::find(keep.begin(), keep.end(), v.name) == keep.end();
                }), vars.end());
   }
-  printf("device %s (%s), CuCount=%d, N=%d, %zu variants, %d rounds -> %s\n", prop.name,
-         prop.gcnArchName, cu, N, vars.size(), rounds, csv.c_str());
+  printf("device %s (%s), CuCount=%d, N=%d, %zu variants, %d rounds, weight pad %s -> %s\n", prop.name,
+         prop.gcnArchName, cu, N, vars.size(), rounds,
+         pad_mode < 0 ? "none" : pad_mode == 0 ? "PR#55090 rule" : (std::to_string(pad_mode) + " elems").c_str(),
+         csv.c_str());
   FILE* f = fopen(csv.c_str(), "w");
   fprintf(f, "arch,N,M,K,calls,variant,dot,ytile,unrl,waves,kernel,is_vllm_default,us,gbps,max_rel_err\n");
   hipEvent_t e0, e1;
   CHECK(hipEventCreate(&e0)); CHECK(hipEventCreate(&e1));
 
   for (auto [M, K, calls] : shapes) {
-    size_t n = (size_t)M * K, bytes = n * 2;
+    int ldw = K + (pad_mode < 0 ? 0 : pad_mode > 0 ? pad_mode : ((K * 2) % 2048 == 0 ? 64 : 0));
+    g_wpad = ldw - K;
+    size_t n = (size_t)M * ldw, bytes = (size_t)M * K * 2;  // bytes = useful weight bytes (GB/s)
     int nb = std::max<int>(2, (int)((size_t)rot_mb * (1 << 20) / bytes) + 1);
     std::vector<bf16*> W(nb);
     for (int b = 0; b < nb; b++) {
-      CHECK(hipMalloc(&W[b], bytes));
+      CHECK(hipMalloc(&W[b], n * 2));
       fill_rand<<<1024, 256>>>(W[b], n, 1234 + b);
     }
     bf16 *x, *y; float* yref;
     CHECK(hipMalloc(&x, (size_t)N * K * 2)); CHECK(hipMalloc(&y, (size_t)N * M * 2));
     CHECK(hipMalloc(&yref, (size_t)N * M * 4));
     fill_rand<<<64, 256>>>(x, (size_t)N * K, 99);
-    ref_gemv<<<dim3(M, N), 256>>>(W[0], x, yref, M, K);
+    ref_gemv<<<dim3(M, N), 256>>>(W[0], x, yref, M, K, ldw);
     std::vector<float> href((size_t)N * M);
     std::vector<bf16> hy((size_t)N * M);
     CHECK(hipMemcpy(href.data(), yref, href.size() * 4, hipMemcpyDeviceToHost));

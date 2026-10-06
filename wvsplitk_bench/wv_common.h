@@ -82,6 +82,8 @@ namespace nativedot0 {
 }  // namespace nativedot0
 
 using bf16 = __hip_bfloat16;
+// weight row stride = K + g_wpad elements (vllm PR #55090 pads by 64 bf16 = 128 B when K*2 % 2048 == 0)
+inline int g_wpad = 0;
 const char* const DOT_PREFIX[3] = {"fp", "nd", "nz"};
 constexpr int MAX_LDS_LEN = LDS_SIZE / 2;  // elements, as in vllm host code
 
@@ -113,17 +115,17 @@ Launcher make_launcher() {
     int wv = mindiv_safe(M, cu * YT, WV);
     dim3 grid(cu), block(32, WV);
     std::string k = kernel_for(M, K, N, YT);
-    // args as in vllm: (K, Kap=W stride, Kbp=x stride, M, Bx, By, B=W, A=x, BIAS, C, wv, cu)
+    // args as in vllm: (K, Kap=W row stride, Kbp=x stride, M, Bx, By, B=W, A=x, BIAS, C, wv, cu)
 #define LAUNCH(NS)                                                                              \
   if (k == "sml")                                                                               \
     NS::wvSplitK_hf_sml_<bf16, 32, YT, WV, 8, U, N>                                             \
-        <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);                          \
+        <<<grid, block>>>(K, K + g_wpad, K, M, 1, 1, W, x, nullptr, y, wv, cu);                          \
   else if (k == "hf")                                                                           \
     NS::wvSplitK_hf_<bf16, 32, YT, WV, 8, U, N>                                                 \
-        <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);                          \
+        <<<grid, block>>>(K, K + g_wpad, K, M, 1, 1, W, x, nullptr, y, wv, cu);                          \
   else                                                                                          \
     NS::wvSplitK_hf_big_<bf16, 32, YT, WV, 8, U, N>                                             \
-        <<<grid, block>>>(K, K, K, M, 1, 1, W, x, nullptr, y, wv, cu);
+        <<<grid, block>>>(K, K + g_wpad, K, M, 1, 1, W, x, nullptr, y, wv, cu);
     if constexpr (DOT == 1) { LAUNCH(nativedot) } else if constexpr (DOT == 2) { LAUNCH(nativedot0) } else { LAUNCH(fp32dot) }
 #undef LAUNCH
   };
